@@ -49,6 +49,10 @@ The `rosmon2` executable is an alias for `mon2`, so this is equivalent:
 rosmon2 launch rosmon2 demo.launch.py
 ```
 
+## Screenshot
+
+![rosmon2 terminal process monitor](docs/rosmon2-terminal.png)
+
 ## Terminal controls
 
 While a launch is running, the status bar shows each process and its state.
@@ -75,10 +79,20 @@ Global controls are available without selecting a process:
 | `Ctrl-C` | Gracefully stop the complete launch |
 
 Namespace mode groups processes by their top-level ROS namespace, including
-nodes in child namespaces. Select a namespace and press `k` to stop all its
-nodes, `s` to start all its nodes, or `i` to inspect and control the individual
-nodes. Use `m` to mute all output from the namespace and `u` to unmute it.
-Press `Backspace` to return from inspection to the namespace list.
+nodes in child namespaces. Each namespace displays `[alive:dead]` process
+counts. Its background is green when all processes are alive, yellow when only
+some are alive, and red when all are dead.
+
+Select a namespace with its displayed key, then press:
+
+| Key | Namespace action |
+| --- | --- |
+| `s` | Start every process in the namespace |
+| `k` | Stop every process in the namespace |
+| `m` | Mute output from the namespace |
+| `u` | Unmute output from the namespace |
+| `i` | Inspect and control the individual processes |
+| `Backspace` | Return from inspection to the namespace list |
 
 ## Command-line options
 
