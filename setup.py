@@ -19,10 +19,15 @@ setup(
     install_requires=['setuptools'],
     extras_require={'test': ['pytest']},
     zip_safe=True,
-    maintainer='rosmon2 maintainers',
-    maintainer_email='student@example.com',
+    maintainer='Gibson',
+    maintainer_email='gibson.hu@uts.edu.au',
     description='A rosmon-style terminal launcher and process monitor for ROS 2.',
     license='BSD-3-Clause',
+    url='https://github.com/GibsonHu/rosmon2',
+    project_urls={
+        'Bug Tracker': 'https://github.com/GibsonHu/rosmon2/issues',
+        'Source': 'https://github.com/GibsonHu/rosmon2',
+    },
     entry_points={
         'console_scripts': [
             'mon2 = rosmon2.cli:main',

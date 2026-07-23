@@ -3,8 +3,11 @@
   <name>rosmon2</name>
   <version>0.1.0</version>
   <description>A rosmon-style terminal launcher and process monitor for ROS 2.</description>
-  <maintainer email="student@example.com">rosmon2 maintainers</maintainer>
+  <maintainer email="gibson.hu@uts.edu.au">Gibson</maintainer>
   <license>BSD-3-Clause</license>
+  <url type="website">https://github.com/GibsonHu/rosmon2</url>
+  <url type="repository">https://github.com/GibsonHu/rosmon2.git</url>
+  <url type="bugtracker">https://github.com/GibsonHu/rosmon2/issues</url>
 
   <buildtool_depend>ament_python</buildtool_depend>
 
