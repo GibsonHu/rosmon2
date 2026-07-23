@@ -1,43 +1,136 @@
 # rosmon2
 
-`rosmon2` is a rosmon-style terminal launcher and process monitor for ROS 2. It
-uses the native ROS 2 `launch` engine, so Python, XML, and YAML launch files and
-their normal substitutions/includes remain supported.
+`rosmon2` is a rosmon-style launcher and terminal process monitor for ROS 2.
+It runs launch files through the native ROS 2 `launch` engine, so existing
+Python, XML, and YAML launch files keep their normal arguments, substitutions,
+and includes.
+
+`rosmon2` is inspired by [xqms/rosmon](https://github.com/xqms/rosmon), but is
+an independent ROS 2 implementation and does not require ROS 1.
+
+## Installation and quick start
+
+Add this repository to a ROS 2 workspace, install its dependencies, and build
+it with `colcon`:
 
 ```bash
-conda activate ros_env
-# Prevent packages in ~/.local from overriding ros_env's build tools.
-export PYTHONNOUSERSITE=1
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+git clone https://github.com/GibsonHu/rosmon2.git
 
+cd ~/ros2_ws
+source /opt/ros/${ROS_DISTRO}/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select rosmon2
 source install/setup.bash
-
-mon2 launch path/to/system.launch.py use_sim_time:=true
-mon2 launch my_package system.launch.py use_sim_time:=true
 ```
 
-If this repository is itself the workspace root, run those commands from this
-directory. If it lives under a workspace `src/` directory, run `colcon build`
-from the workspace root as usual.
-
-The interactive UI follows rosmon's controls:
-
-- `a-z`, `A-Z`, `0-9`: select a process; then `s` starts, `k` stops, `m` mutes,
-  `u` unmutes, and `d` starts it under gdb.
-- `F6` / `F7`: start/stop all processes.
-- `F8`: show stderr/WARN+ output only.
-- `F9` / `F10`: mute/unmute all process output.
-- `Ctrl-C`: gracefully stop the complete launch.
-
-Useful non-interactive forms include:
+Then launch the included talker/listener demo:
 
 ```bash
-mon2 launch --disable-ui my_package system.launch.py
-mon2 launch --list-args my_package system.launch.py
-mon2 launch --benchmark my_package system.launch.py
-mon2 launch --no-start my_package system.launch.py
+mon2 launch rosmon2 demo.launch.py
 ```
 
-The terminal design and CLI conventions are modeled after
-[xqms/rosmon](https://github.com/xqms/rosmon), which targets ROS 1. This package
-is an independent ROS 2 implementation and does not depend on ROS 1.
+Launch arguments use the standard ROS 2 `name:=value` syntax:
+
+```bash
+mon2 launch rosmon2 demo.launch.py namespace:=demo
+```
+
+You can launch a file by package and filename, as above, or by path:
+
+```bash
+mon2 launch path/to/system.launch.py use_sim_time:=true
+```
+
+The `rosmon2` executable is an alias for `mon2`, so this is equivalent:
+
+```bash
+rosmon2 launch rosmon2 demo.launch.py
+```
+
+## Terminal controls
+
+While a launch is running, the status bar shows each process and its state.
+Select a process with its displayed key (`a-z`, `A-Z`, or `0-9`), then press:
+
+| Key | Action |
+| --- | --- |
+| `s` | Start the selected process |
+| `k` | Stop the selected process |
+| `m` | Mute the selected process |
+| `u` | Unmute the selected process |
+| `d` | Start the selected process under `gdb` |
+
+Global controls are available without selecting a process:
+
+| Key | Action |
+| --- | --- |
+| `F6` | Start all processes |
+| `F7` | Stop all processes |
+| `F8` | Toggle WARN-and-higher output |
+| `F9` | Mute all process output |
+| `F10` | Unmute all process output |
+| `Ctrl-C` | Gracefully stop the complete launch |
+
+## Command-line options
+
+Run without the interactive terminal UI:
+
+```bash
+mon2 launch --disable-ui rosmon2 demo.launch.py
+```
+
+List the arguments declared by a launch file:
+
+```bash
+mon2 launch --list-args rosmon2 demo.launch.py
+```
+
+Load a launch description and exit, which is useful for benchmarking launch
+file parsing:
+
+```bash
+mon2 launch --benchmark rosmon2 demo.launch.py
+```
+
+Discover processes without leaving them running:
+
+```bash
+mon2 launch --no-start rosmon2 demo.launch.py
+```
+
+Write combined stdout and stderr to a chosen file:
+
+```bash
+mon2 launch --log ./system.log --flush-log my_package system.launch.py
+```
+
+By default, process output is also written to a timestamped file under
+`/tmp/rosmon2_*.log`. Use `mon2 launch --help` to see every option.
+
+## Building from source
+
+`rosmon2` is an `ament_python` package. If the repository is your workspace
+root, build it from that directory. If it is inside a workspace's `src/`
+directory, run `colcon build` from the workspace root:
+
+```bash
+source /opt/ros/${ROS_DISTRO}/setup.bash
+colcon build --packages-select rosmon2
+source install/setup.bash
+```
+
+To run the tests:
+
+```bash
+colcon test --packages-select rosmon2
+colcon test-result --verbose
+```
+
+If packages installed in `~/.local` override your ROS 2 or workspace build
+tools, repeat the build with `PYTHONNOUSERSITE=1` in the environment.
+
+## License
+
+`rosmon2` is licensed under the [BSD 3-Clause License](LICENSE).

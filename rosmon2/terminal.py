@@ -1,5 +1,6 @@
 """Small ANSI terminal UI patterned after rosmon's interface."""
 
+from math import cos, pi, sin
 import os
 import re
 import shutil
@@ -13,20 +14,68 @@ from .model import ProcessRecord, selection_key, State
 
 ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 SEVERITY_RE = re.compile(r'\[(DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\]')
+RGB_MATRIX = (
+    (3.2406, -1.5372, -0.4986),
+    (-0.9689, 1.8758, 0.0415),
+    (0.0557, -0.2040, 1.0570),
+)
+
+
+def _hsluv_label_color(hue: float):
+    """Return rosmon's HSLuv(H, 100, 20) process-label color."""
+    lightness = 20.0
+    hue_radians = hue / 360.0 * 2.0 * pi
+    sin_hue = sin(hue_radians)
+    cos_hue = cos(hue_radians)
+    sub1 = (lightness + 16.0) ** 3 / 1560896.0
+    sub2 = sub1 if sub1 > 0.008856 else lightness / 903.3
+    max_chroma = float('inf')
+    for m1, m2, m3 in RGB_MATRIX:
+        top = (0.99915 * m1 + 1.05122 * m2 + 1.14460 * m3) * sub2
+        right = 0.86330 * m3 - 0.17266 * m2
+        left = 0.12949 * m3 - 0.38848 * m1
+        bottom = (right * sin_hue + left * cos_hue) * sub2
+        for boundary in (0.0, 1.0):
+            chroma = lightness * (top - 1.05122 * boundary)
+            chroma /= bottom + 0.17266 * sin_hue * boundary
+            if 0.0 < chroma < max_chroma:
+                max_chroma = chroma
+
+    u_value = cos_hue * max_chroma
+    v_value = sin_hue * max_chroma
+    y_value = ((lightness + 16.0) / 116.0) ** 3
+    var_u = u_value / (13.0 * lightness) + 0.19784
+    var_v = v_value / (13.0 * lightness) + 0.46834
+    x_value = -(9.0 * y_value * var_u)
+    x_value /= (var_u - 4.0) * var_v - var_u * var_v
+    z_value = (9.0 * y_value - 15.0 * var_v * y_value - var_v * x_value)
+    z_value /= 3.0 * var_v
+
+    def from_linear(component):
+        if component <= 0.0031308:
+            return 12.92 * component
+        return 1.055 * component ** (1.0 / 2.4) - 0.055
+
+    xyz = (x_value, y_value, z_value)
+    rgb = [from_linear(sum(row[i] * xyz[i] for i in range(3)))
+           for row in RGB_MATRIX]
+    return tuple(max(0, min(255, int(component * 255.0))) for component in rgb)
 
 
 class TerminalUI:
     """Render streaming logs with a persistent rosmon-style status bar."""
 
     RESET = '\x1b[0m'
-    BAR = '\x1b[48;5;58m\x1b[97m'
-    BAR_KEY = '\x1b[48;5;60m\x1b[97m'
-    RUNNING = '\x1b[30;42m'
-    CRASHED = '\x1b[30;41m'
-    WAITING = '\x1b[30;43m'
-    IDLE = '\x1b[97;40m'
-    KEY = '\x1b[30;47m'
-    MUTED_KEY = '\x1b[97;44m'
+    # Exact true-color styles from rosmon's UI. Its packed 0xBBGGRR values
+    # 0x404000, 0x606000, and 0xC8C8C8 become the RGB values below.
+    BAR = '\x1b[48;2;0;64;64m\x1b[38;2;255;255;255m'
+    BAR_KEY = '\x1b[48;2;0;96;96m\x1b[38;2;255;255;255m'
+    RUNNING = '\x1b[38;2;0;0;0m\x1b[48;2;24;178;24m'
+    CRASHED = '\x1b[38;2;0;0;0m\x1b[48;2;178;24;24m'
+    WAITING = '\x1b[38;2;0;0;0m\x1b[48;2;178;104;24m'
+    IDLE = '\x1b[38;2;255;255;255m\x1b[48;2;0;0;0m'
+    KEY = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;200m'
+    MUTED_KEY = '\x1b[38;2;255;255;255m\x1b[48;2;165;0;0m'
 
     def __init__(self, enabled: bool, on_key: Callable[[str], None]):
         self.enabled = bool(enabled and sys.stdin.isatty() and sys.stdout.isatty())
@@ -83,7 +132,15 @@ class TerminalUI:
                 continue
             label = f'{source:>{width}}:'
             if self.enabled:
-                label = '\x1b[48;5;24m\x1b[97m' + label + self.RESET
+                background = self._label_color(source)
+                if background is None:
+                    label = '\x1b[38;2;178;178;178m' + label + self.RESET
+                else:
+                    red, green, blue = background
+                    label = (
+                        f'\x1b[48;2;{red};{green};{blue}m'
+                        '\x1b[38;2;255;255;255m' + label + self.RESET
+                    )
                 style = {
                     'DEBUG': '\x1b[32m',
                     'WARNING': '\x1b[33m',
@@ -110,12 +167,22 @@ class TerminalUI:
             return value.upper()
         return 'ERROR' if is_stderr else 'INFO'
 
+    def _label_color(self, source: str):
+        """Return a stable foreground/background pair for a process label."""
+        records = list(self.records)
+        for index, record in enumerate(records):
+            if record.display_name == source:
+                hue = index * 360.0 / max(1, len(records))
+                return _hsluv_label_color(hue)
+        # Framework messages are plain gray, as rosmon's own messages are.
+        return None
+
     def redraw(self) -> None:
         if not self.enabled or not self._started:
             return
         self._erase_status()
         columns = max(40, shutil.get_terminal_size((100, 24)).columns)
-        sep = '\x1b[38;5;58m' + ('▂' * columns) + self.RESET
+        sep = '\x1b[38;2;0;64;64m' + ('▂' * columns) + self.RESET
         if self.selected is None:
             menu = self._menu_item('A-Z', 'Node actions')
             menu += self._menu_item('F6', 'Start all')
@@ -211,9 +278,32 @@ class TerminalUI:
     def _visible_len(text: str) -> int:
         return len(ANSI_RE.sub('', text))
 
+    @staticmethod
+    def _truncate_ansi(text: str, columns: int) -> str:
+        """Truncate visible text while retaining embedded ANSI styles."""
+        output = []
+        position = 0
+        visible = 0
+        for match in ANSI_RE.finditer(text):
+            chunk = text[position:match.start()]
+            remaining = columns - visible
+            if remaining <= 0:
+                break
+            output.append(chunk[:remaining])
+            visible += min(len(chunk), remaining)
+            if len(chunk) > remaining:
+                break
+            output.append(match.group())
+            position = match.end()
+        else:
+            remaining = columns - visible
+            if remaining > 0:
+                output.append(text[position:position + remaining])
+        return ''.join(output)
+
     def _fit(self, text: str, columns: int) -> str:
         plain = ANSI_RE.sub('', text)
         if len(plain) <= columns:
             return text + self.BAR + (' ' * (columns - len(plain))) + self.RESET
         # The status remains useful on narrow terminals even without every action.
-        return plain[:columns]
+        return self._truncate_ansi(text, columns) + self.RESET

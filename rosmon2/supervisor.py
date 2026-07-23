@@ -151,11 +151,16 @@ class Supervisor:
         if isinstance(action, Node):
             try:
                 # node_name is already the fully-qualified name after Node.execute().
-                name = action.node_name.replace('<node_namespace_unspecified>', '')
-                return '/' + name.lstrip('/')
+                return Supervisor._normalize_display_name(action.node_name)
             except (RuntimeError, AttributeError):
                 pass
         return fallback.rsplit('-', 1)[0] if '-' in fallback else fallback
+
+    @staticmethod
+    def _normalize_display_name(name: str) -> str:
+        """Format a ROS name like rosmon, without its leading root slash."""
+        name = name.replace('<node_namespace_unspecified>', '')
+        return name.lstrip('/')
 
     @staticmethod
     def _silence_native_process_screen_logger(process_name: str) -> None:
