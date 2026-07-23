@@ -77,3 +77,44 @@ def test_namespace_mode_can_mute_and_unmute_a_group():
     supervisor.handle_key('u')
     assert not move_group.muted
     assert not command_server.muted
+
+
+def test_node_search_filters_navigates_and_selects_full_names():
+    supervisor = Supervisor('', [], ui=False)
+    receiver = ProcessRecord(
+        key=0, display_name='ur10e/ur_ros_rtde/robot_state_receiver')
+    server = ProcessRecord(
+        key=1, display_name='ur10e/ur_ros_rtde/command_server')
+    camera = ProcessRecord(key=2, display_name='external/camera')
+    supervisor.records.extend([receiver, server, camera])
+    supervisor.ui.set_records(supervisor.records)
+
+    supervisor.handle_key('/')
+    for key in 'ur_ros_rtde':
+        supervisor.handle_key(key)
+
+    assert supervisor.ui.search_active
+    assert supervisor.ui.search_matches() == [receiver, server]
+    supervisor.handle_key('\t')
+    supervisor.handle_key('\n')
+    assert not supervisor.ui.search_active
+    assert supervisor.ui.selected == 1
+
+    supervisor.handle_key('m')
+    assert server.muted
+    assert not receiver.muted
+
+
+def test_node_search_backspace_and_escape_cancel():
+    supervisor = Supervisor('', [], ui=False)
+    supervisor.records.append(ProcessRecord(key=0, display_name='robot/driver'))
+    supervisor.ui.set_records(supervisor.records)
+
+    supervisor.handle_key('/')
+    supervisor.handle_key('x')
+    supervisor.handle_key('\x7f')
+    assert supervisor.ui.search_query == ''
+
+    supervisor.handle_key('ESC')
+    assert not supervisor.ui.search_active
+    assert supervisor.ui.selected is None

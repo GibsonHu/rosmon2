@@ -76,7 +76,12 @@ Global controls are available without selecting a process:
 | `F8` | Toggle WARN-and-higher output |
 | `F9` | Mute all process output |
 | `F10` | Unmute all process output |
+| `/` | Search nodes by full name |
 | `Ctrl-C` | Gracefully stop the complete launch |
+
+Node search matches substrings against full names, including namespaces. Type
+`/` to start searching, use `Tab` or the arrow keys to select a match, and
+press `Enter` to open its node actions. Press `Escape` to cancel the search.
 
 Namespace mode groups processes by their top-level ROS namespace, including
 nodes in child namespaces. Each namespace displays `[alive:dead]` process

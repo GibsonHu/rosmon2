@@ -75,6 +75,8 @@ class TerminalUI:
     PARTIAL = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;0m'
     WAITING = '\x1b[38;2;0;0;0m\x1b[48;2;178;104;24m'
     IDLE = '\x1b[38;2;255;255;255m\x1b[48;2;0;0;0m'
+    NODE_SELECTED = '\x1b[38;2;0;0;0m\x1b[48;2;135;206;250m'
+    SEARCH_SELECTED = '\x1b[38;2;0;0;0m\x1b[48;2;0;178;178m'
     KEY = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;200m'
     MUTED_KEY = '\x1b[38;2;255;255;255m\x1b[48;2;165;0;0m'
 
@@ -85,10 +87,15 @@ class TerminalUI:
         self.selected: Optional[int] = None
         self.namespace_mode = False
         self.namespace_inspect: Optional[str] = None
+        self.search_active = False
+        self.search_query = ''
+        self.search_selected = 0
         self.warn_only = False
         self._saved_termios = None
         self._status_lines = 0
         self._buffer = ''
+        self._loop = None
+        self._escape_timer = None
         self._started = False
 
     def start(self, loop) -> None:
@@ -103,6 +110,7 @@ class TerminalUI:
         # shut down the complete LaunchService.  add_reader() only invokes
         # _read_input when data is ready, so blocking terminal I/O is safe.
         os.set_blocking(sys.stdout.fileno(), True)
+        self._loop = loop
         loop.add_reader(sys.stdin.fileno(), self._read_input)
         sys.stdout.write('\x1b[?25l')
         sys.stdout.flush()
@@ -117,6 +125,9 @@ class TerminalUI:
                 loop.remove_reader(sys.stdin.fileno())
             except Exception:
                 pass
+        if self._escape_timer is not None:
+            self._escape_timer.cancel()
+            self._escape_timer = None
         self._erase_status()
         sys.stdout.write(self.RESET + '\x1b[?25h')
         sys.stdout.flush()
@@ -149,6 +160,11 @@ class TerminalUI:
         if self.namespace_mode and self.namespace_inspect is not None:
             return self.records_in_namespace(self.namespace_inspect)
         return list(self.records)
+
+    def search_matches(self):
+        """Return visible nodes whose full names contain the search query."""
+        return [record for record in self.visible_records()
+                if self.search_query in record.display_name]
 
     @staticmethod
     def namespace_counts(records):
@@ -240,7 +256,9 @@ class TerminalUI:
         columns = max(40, shutil.get_terminal_size((100, 24)).columns)
         sep = '\x1b[38;2;0;64;64m' + ('▂' * columns) + self.RESET
         showing_namespaces = self.namespace_mode and self.namespace_inspect is None
-        if self.selected is None:
+        if self.search_active:
+            menu = self.BAR + f' Searching for: {self.search_query}'
+        elif self.selected is None:
             menu = self._menu_item(
                 'A-Z', 'Namespace actions' if showing_namespaces else 'Node actions')
             menu += self._menu_item(
@@ -252,6 +270,7 @@ class TerminalUI:
             menu += self._menu_item('F8', 'Toggle WARN+ only')
             menu += self._menu_item('F9', 'Mute all')
             menu += self._menu_item('F10', 'Unmute all')
+            menu += self._menu_item('/', 'Node search')
             if self.warn_only:
                 menu += ' \x1b[30;45m ! WARN+ output only ! ' + self.RESET
             if any(r.muted for r in self.records):
@@ -284,7 +303,10 @@ class TerminalUI:
                                         'unmute' if record.muted else 'mute')
         menu = self._fit(menu, columns)
 
-        if showing_namespaces:
+        if self.search_active:
+            entries = [(record.display_name, self.state_style(record.state), record.muted)
+                       for record in self.search_matches()]
+        elif showing_namespaces:
             entries = []
             for namespace in self.namespaces():
                 members = self.records_in_namespace(namespace)
@@ -301,6 +323,22 @@ class TerminalUI:
         blocks = []
         line = ''
         for index, (display_name, state_style, muted) in enumerate(entries):
+            if self.search_active:
+                name = display_name.lstrip('/')
+                max_name_length = max(1, columns - 2)
+                if len(name) > max_name_length:
+                    name = name[:max_name_length - 1] + '…'
+                label = f' {name} '
+                style = self.SEARCH_SELECTED if self.search_selected == index else ''
+                block = style + label + self.RESET
+                plain_len = len(label)
+                if self._visible_len(line) + plain_len + 1 > columns and line:
+                    blocks.append(line)
+                    line = block
+                else:
+                    line += (' ' if line else '') + block
+                continue
+
             key = selection_key(index)
             key_text = key if key is not None else ' '
             key_style = self.MUTED_KEY if muted else self.KEY
@@ -313,7 +351,11 @@ class TerminalUI:
                 name = name[:max_name_length - 1] + '…'
             selected = self.selected == index
             label = f'[{name}]' if selected and not showing_namespaces else f' {name} '
-            block = key_style + key_text + state_style + label + self.RESET
+            label_style = (
+                self.NODE_SELECTED
+                if selected and not showing_namespaces else state_style
+            )
+            block = key_style + key_text + label_style + label + self.RESET
             plain_len = 1 + len(label)
             if self._visible_len(line) + plain_len + 1 > columns and line:
                 blocks.append(line)
@@ -323,7 +365,8 @@ class TerminalUI:
         if line:
             blocks.append(line)
         if not blocks:
-            blocks = [self.IDLE + ' waiting for processes ' + self.RESET]
+            message = ' no matching nodes ' if self.search_active else ' waiting for processes '
+            blocks = [self.IDLE + message + self.RESET]
 
         lines = [sep, menu] + blocks
         sys.stdout.write('\n'.join(lines) + '\n')
@@ -344,10 +387,15 @@ class TerminalUI:
             data = os.read(sys.stdin.fileno(), 64).decode(errors='ignore')
         except (BlockingIOError, OSError):
             return
+        if self._escape_timer is not None:
+            self._escape_timer.cancel()
+            self._escape_timer = None
         self._buffer += data
         keys = {
             '\x1b[15~': 'F5', '\x1b[17~': 'F6', '\x1b[18~': 'F7', '\x1b[19~': 'F8',
             '\x1b[20~': 'F9', '\x1b[21~': 'F10',
+            '\x1b[A': 'UP', '\x1b[B': 'DOWN',
+            '\x1b[C': 'RIGHT', '\x1b[D': 'LEFT',
         }
         while self._buffer:
             matched = False
@@ -359,10 +407,23 @@ class TerminalUI:
                     break
             if matched:
                 continue
+            if self._buffer == '\x1b':
+                if self._loop is None:
+                    self._flush_escape()
+                    continue
+                self._escape_timer = self._loop.call_later(0.03, self._flush_escape)
+                break
             if self._buffer.startswith('\x1b') and len(self._buffer) < 3:
                 break
             char, self._buffer = self._buffer[0], self._buffer[1:]
             self.on_key(char)
+
+    def _flush_escape(self) -> None:
+        """Emit a standalone Escape after allowing time for an arrow sequence."""
+        self._escape_timer = None
+        if self._buffer == '\x1b':
+            self._buffer = ''
+            self.on_key('ESC')
 
     @staticmethod
     def _visible_len(text: str) -> int:

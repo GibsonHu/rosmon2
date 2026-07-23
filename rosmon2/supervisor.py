@@ -219,6 +219,10 @@ class Supervisor:
 
     def handle_key(self, key: str) -> None:
         """Apply rosmon's two-key node action interface."""
+        if self.ui.search_active:
+            self._handle_search_key(key)
+            return
+
         if key == 'F5':
             self.ui.namespace_mode = not self.ui.namespace_mode
             self.ui.namespace_inspect = None
@@ -227,6 +231,12 @@ class Supervisor:
             return
 
         if self.ui.selected is None:
+            if key == '/':
+                self.ui.search_active = True
+                self.ui.search_query = ''
+                self.ui.search_selected = 0
+                self.ui.redraw()
+                return
             if key == 'F6':
                 for record in self.records:
                     self.start(record)
@@ -305,6 +315,53 @@ class Supervisor:
             record.muted = False
         elif key == 'd':
             self.debug(record)
+        self.ui.redraw()
+
+    def _handle_search_key(self, key: str) -> None:
+        """Edit or navigate the interactive full-name node search."""
+        matches = self.ui.search_matches()
+        if key in ('\n', '\r'):
+            selected = (
+                matches[self.ui.search_selected]
+                if self.ui.search_selected < len(matches) else None
+            )
+            self.ui.search_active = False
+            self.ui.search_query = ''
+            self.ui.search_selected = 0
+            self.ui.selected = None
+            if selected is not None:
+                # Search always selects an individual node, even when it was
+                # opened from the namespace overview.
+                self.ui.namespace_mode = False
+                self.ui.namespace_inspect = None
+                self.ui.selected = self.records.index(selected)
+            self.ui.redraw()
+            return
+
+        if key == 'ESC':
+            self.ui.search_active = False
+            self.ui.search_query = ''
+            self.ui.search_selected = 0
+            self.ui.selected = None
+            self.ui.redraw()
+            return
+
+        if key in ('\b', '\x7f'):
+            self.ui.search_query = self.ui.search_query[:-1]
+            self.ui.search_selected = 0
+        elif key in ('\t', 'RIGHT', 'DOWN'):
+            if matches:
+                self.ui.search_selected = (self.ui.search_selected + 1) % len(matches)
+        elif key in ('LEFT', 'UP'):
+            if matches:
+                self.ui.search_selected = (self.ui.search_selected - 1) % len(matches)
+        elif len(key) == 1 and key.isprintable() and not key.isspace():
+            self.ui.search_query += key
+            self.ui.search_selected = 0
+
+        matches = self.ui.search_matches()
+        if matches and self.ui.search_selected >= len(matches):
+            self.ui.search_selected = 0
         self.ui.redraw()
 
     def stop(self, record: ProcessRecord) -> None:

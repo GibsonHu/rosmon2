@@ -33,6 +33,7 @@ def test_status_colors_match_rosmon_reference_palette():
     assert '\x1b[48;2;200;200;200m' in TerminalUI.KEY
     assert '\x1b[48;2;24;178;24m' in TerminalUI.RUNNING
     assert '\x1b[48;2;200;200;0m' in TerminalUI.PARTIAL
+    assert '\x1b[48;2;135;206;250m' in TerminalUI.NODE_SELECTED
 
 
 def test_bottom_bar_uses_rosmon_reference_colors():
@@ -70,6 +71,24 @@ def test_status_bar_shows_complete_process_names(monkeypatch, capsys):
     assert 'ardware_setup' not in output.replace('hardware_setup', '')
 
 
+def test_selected_node_uses_light_blue_background(monkeypatch, capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui.selected = 0
+    ui.records = [
+        ProcessRecord(key=0, display_name='ur10e/command_server',
+                      state=State.RUNNING),
+    ]
+    monkeypatch.setattr('rosmon2.terminal.shutil.get_terminal_size',
+                        lambda _fallback: os.terminal_size((100, 24)))
+
+    ui.redraw()
+
+    output = capsys.readouterr().out
+    assert TerminalUI.NODE_SELECTED + '[ur10e/command_server]' in output
+
+
 def test_namespace_mode_groups_child_namespaces_under_the_top_level():
     ui = TerminalUI(False, lambda _key: None)
     ui.records = [
@@ -81,6 +100,31 @@ def test_namespace_mode_groups_child_namespaces_under_the_top_level():
 
     assert ui.namespaces() == ['/', 'camera', 'ur10e']
     assert [record.key for record in ui.records_in_namespace('ur10e')] == [1, 2]
+
+
+def test_search_matches_full_names_including_namespaces():
+    ui = TerminalUI(False, lambda _key: None)
+    move_group = ProcessRecord(key=0, display_name='ur10e/move_group')
+    command_server = ProcessRecord(
+        key=1, display_name='ur10e/ur_ros_rtde/command_server')
+    camera = ProcessRecord(key=2, display_name='camera/image_publisher')
+    ui.records = [move_group, command_server, camera]
+
+    ui.search_query = 'ur_ros_rtde'
+
+    assert ui.search_matches() == [command_server]
+
+
+def test_search_is_scoped_to_inspected_namespace():
+    ui = TerminalUI(False, lambda _key: None)
+    ur_camera = ProcessRecord(key=0, display_name='ur10e/camera')
+    external_camera = ProcessRecord(key=1, display_name='external/camera')
+    ui.records = [ur_camera, external_camera]
+    ui.namespace_mode = True
+    ui.namespace_inspect = 'ur10e'
+    ui.search_query = 'camera'
+
+    assert ui.search_matches() == [ur_camera]
 
 
 def test_namespace_colors_reflect_alive_and_dead_counts():
@@ -132,6 +176,83 @@ def test_selected_namespace_does_not_wrap_its_name_in_brackets(monkeypatch, caps
     output = ANSI_RE.sub('', capsys.readouterr().out)
     assert 'ur10e [1:1]' in output
     assert '[ur10e [1:1]]' not in output
+
+
+def test_search_status_shows_query_and_only_matching_nodes(monkeypatch, capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui.search_active = True
+    ui.search_query = 'receiver'
+    ui.records = [
+        ProcessRecord(key=0, display_name='ur10e/robot_state_receiver'),
+        ProcessRecord(key=1, display_name='ur10e/command_server'),
+    ]
+    monkeypatch.setattr('rosmon2.terminal.shutil.get_terminal_size',
+                        lambda _fallback: os.terminal_size((100, 24)))
+
+    ui.redraw()
+
+    output = ANSI_RE.sub('', capsys.readouterr().out)
+    assert 'Searching for: receiver' in output
+    assert 'ur10e/robot_state_receiver' in output
+    assert 'ur10e/command_server' not in output
+
+
+def test_input_reader_decodes_search_navigation_keys(monkeypatch):
+    class FakeStdin:
+        @staticmethod
+        def fileno():
+            return 10
+
+    pressed = []
+    chunks = iter((b'\x1b[A', b'\x1b'))
+    monkeypatch.setattr('rosmon2.terminal.sys.stdin', FakeStdin())
+    monkeypatch.setattr('rosmon2.terminal.os.read', lambda _fd, _size: next(chunks))
+    ui = TerminalUI(False, pressed.append)
+
+    ui._read_input()
+    ui._read_input()
+
+    assert pressed == ['UP', 'ESC']
+
+
+def test_input_reader_waits_for_split_escape_sequence(monkeypatch):
+    class FakeStdin:
+        @staticmethod
+        def fileno():
+            return 10
+
+    class FakeTimer:
+        def __init__(self, callback):
+            self.callback = callback
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeLoop:
+        def __init__(self):
+            self.timers = []
+
+        def call_later(self, _delay, callback):
+            timer = FakeTimer(callback)
+            self.timers.append(timer)
+            return timer
+
+    pressed = []
+    chunks = iter((b'\x1b', b'[A'))
+    monkeypatch.setattr('rosmon2.terminal.sys.stdin', FakeStdin())
+    monkeypatch.setattr('rosmon2.terminal.os.read', lambda _fd, _size: next(chunks))
+    ui = TerminalUI(False, pressed.append)
+    ui._loop = FakeLoop()
+
+    ui._read_input()
+    assert pressed == []
+    ui._read_input()
+
+    assert ui._loop.timers[0].cancelled
+    assert pressed == ['UP']
 
 
 def test_start_keeps_shared_terminal_output_blocking(monkeypatch):
