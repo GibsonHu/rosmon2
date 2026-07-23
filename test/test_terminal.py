@@ -1,5 +1,7 @@
-from rosmon2.model import ProcessRecord
-from rosmon2.terminal import _hsluv_label_color, TerminalUI
+import os
+
+from rosmon2.model import ProcessRecord, State
+from rosmon2.terminal import ANSI_RE, _hsluv_label_color, TerminalUI
 
 
 def test_ros_severity_takes_precedence_over_stderr_channel():
@@ -30,6 +32,7 @@ def test_status_colors_match_rosmon_reference_palette():
     assert '\x1b[48;2;0;96;96m' in TerminalUI.BAR_KEY
     assert '\x1b[48;2;200;200;200m' in TerminalUI.KEY
     assert '\x1b[48;2;24;178;24m' in TerminalUI.RUNNING
+    assert '\x1b[48;2;200;200;0m' in TerminalUI.PARTIAL
 
 
 def test_bottom_bar_uses_rosmon_reference_colors():
@@ -46,3 +49,133 @@ def test_narrow_menu_preserves_key_background_colors():
     assert TerminalUI.BAR_KEY in fitted
     assert TerminalUI.BAR in fitted
     assert ui._visible_len(fitted) == 20
+
+
+def test_status_bar_shows_complete_process_names(monkeypatch, capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui.records = [
+        ProcessRecord(key=0, display_name='hardware_setup'),
+        ProcessRecord(key=1, display_name='ur10e/ur_ros_rtde/robot_state_receiver'),
+    ]
+    monkeypatch.setattr('rosmon2.terminal.shutil.get_terminal_size',
+                        lambda _fallback: os.terminal_size((50, 24)))
+
+    ui.redraw()
+
+    output = ANSI_RE.sub('', capsys.readouterr().out)
+    assert 'hardware_setup' in output
+    assert 'ur10e/ur_ros_rtde/robot_state_receiver' in output
+    assert 'ardware_setup' not in output.replace('hardware_setup', '')
+
+
+def test_namespace_mode_groups_child_namespaces_under_the_top_level():
+    ui = TerminalUI(False, lambda _key: None)
+    ui.records = [
+        ProcessRecord(key=0, display_name='hardware_setup'),
+        ProcessRecord(key=1, display_name='ur10e/move_group'),
+        ProcessRecord(key=2, display_name='ur10e/ur_ros_rtde/command_server'),
+        ProcessRecord(key=3, display_name='camera/image_publisher'),
+    ]
+
+    assert ui.namespaces() == ['/', 'camera', 'ur10e']
+    assert [record.key for record in ui.records_in_namespace('ur10e')] == [1, 2]
+
+
+def test_namespace_colors_reflect_alive_and_dead_counts():
+    running = ProcessRecord(key=0, display_name='robot/driver', state=State.RUNNING)
+    idle = ProcessRecord(key=1, display_name='robot/helper', state=State.IDLE)
+    crashed = ProcessRecord(key=2, display_name='robot/camera', state=State.CRASHED)
+
+    assert TerminalUI.namespace_counts([running, idle, crashed]) == (1, 2)
+    assert TerminalUI.namespace_style([running]) == TerminalUI.RUNNING
+    assert TerminalUI.namespace_style([running, idle]) == TerminalUI.PARTIAL
+    assert TerminalUI.namespace_style([idle, crashed]) == TerminalUI.CRASHED
+
+
+def test_namespace_status_bar_shows_root_group(monkeypatch, capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui.namespace_mode = True
+    ui.records = [
+        ProcessRecord(key=0, display_name='hardware_setup'),
+        ProcessRecord(key=1, display_name='ur10e/move_group'),
+    ]
+    monkeypatch.setattr('rosmon2.terminal.shutil.get_terminal_size',
+                        lambda _fallback: os.terminal_size((80, 24)))
+
+    ui.redraw()
+
+    output = ANSI_RE.sub('', capsys.readouterr().out)
+    assert '/ [0:1]' in output
+    assert 'ur10e [0:1]' in output
+    assert 'hardware_setup' not in output
+
+
+def test_selected_namespace_does_not_wrap_its_name_in_brackets(monkeypatch, capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui.namespace_mode = True
+    ui.selected = 0
+    ui.records = [
+        ProcessRecord(key=0, display_name='ur10e/move_group', state=State.RUNNING),
+        ProcessRecord(key=1, display_name='ur10e/driver', state=State.CRASHED),
+    ]
+    monkeypatch.setattr('rosmon2.terminal.shutil.get_terminal_size',
+                        lambda _fallback: os.terminal_size((100, 24)))
+
+    ui.redraw()
+
+    output = ANSI_RE.sub('', capsys.readouterr().out)
+    assert 'ur10e [1:1]' in output
+    assert '[ur10e [1:1]]' not in output
+
+
+def test_start_keeps_shared_terminal_output_blocking(monkeypatch):
+    class FakeStream:
+        def __init__(self, fd):
+            self.fd = fd
+            self.output = ''
+
+        @staticmethod
+        def isatty():
+            return True
+
+        def fileno(self):
+            return self.fd
+
+        def write(self, text):
+            self.output += text
+
+        @staticmethod
+        def flush():
+            pass
+
+    class FakeLoop:
+        def __init__(self):
+            self.readers = []
+
+        def add_reader(self, fd, callback):
+            self.readers.append((fd, callback))
+
+    stdin = FakeStream(10)
+    stdout = FakeStream(11)
+    blocking_calls = []
+    monkeypatch.setattr('rosmon2.terminal.sys.stdin', stdin)
+    monkeypatch.setattr('rosmon2.terminal.sys.stdout', stdout)
+    monkeypatch.setattr('rosmon2.terminal.termios.tcgetattr', lambda _fd: [])
+    monkeypatch.setattr('rosmon2.terminal.tty.setcbreak', lambda _fd: None)
+    monkeypatch.setattr(
+        'rosmon2.terminal.os.set_blocking',
+        lambda fd, enabled: blocking_calls.append((fd, enabled)),
+    )
+    loop = FakeLoop()
+
+    ui = TerminalUI(True, lambda _key: None)
+    ui.start(loop)
+
+    assert blocking_calls == [(stdout.fd, True)]
+    assert loop.readers == [(stdin.fd, ui._read_input)]

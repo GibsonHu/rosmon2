@@ -151,10 +151,26 @@ class Supervisor:
         if isinstance(action, Node):
             try:
                 # node_name is already the fully-qualified name after Node.execute().
-                return Supervisor._normalize_display_name(action.node_name)
+                name = action.node_name
+                if Node.UNSPECIFIED_NODE_NAME in name:
+                    # With no explicit ``name=`` ROS uses the name chosen by
+                    # the executable at runtime.  Launch cannot expose that
+                    # value here, but its process label defaults to the node
+                    # executable and is the best available representation.
+                    name = name.replace(
+                        Node.UNSPECIFIED_NODE_NAME,
+                        Supervisor._process_name_without_counter(fallback),
+                    )
+                return Supervisor._normalize_display_name(name)
             except (RuntimeError, AttributeError):
                 pass
-        return fallback.rsplit('-', 1)[0] if '-' in fallback else fallback
+        return Supervisor._process_name_without_counter(fallback)
+
+    @staticmethod
+    def _process_name_without_counter(name: str) -> str:
+        """Remove launch's numeric ``-N`` suffix from a process label."""
+        base, separator, counter = name.rpartition('-')
+        return base if separator and counter.isdigit() else name
 
     @staticmethod
     def _normalize_display_name(name: str) -> str:
@@ -203,6 +219,13 @@ class Supervisor:
 
     def handle_key(self, key: str) -> None:
         """Apply rosmon's two-key node action interface."""
+        if key == 'F5':
+            self.ui.namespace_mode = not self.ui.namespace_mode
+            self.ui.namespace_inspect = None
+            self.ui.selected = None
+            self.ui.redraw()
+            return
+
         if self.ui.selected is None:
             if key == 'F6':
                 for record in self.records:
@@ -226,7 +249,17 @@ class Supervisor:
                     record.muted = False
                 self.ui.redraw()
                 return
-            for index, _record in enumerate(self.records):
+            if (self.ui.namespace_mode and self.ui.namespace_inspect is not None
+                    and key in ('\b', '\x7f')):
+                self.ui.namespace_inspect = None
+                self.ui.redraw()
+                return
+            selectable_count = (
+                len(self.ui.namespaces())
+                if self.ui.namespace_mode and self.ui.namespace_inspect is None
+                else len(self.ui.visible_records())
+            )
+            for index in range(selectable_count):
                 if key == selection_key(index):
                     self.ui.selected = index
                     self.ui.redraw()
@@ -235,9 +268,33 @@ class Supervisor:
 
         index = self.ui.selected
         self.ui.selected = None
-        if index >= len(self.records):
+        if self.ui.namespace_mode and self.ui.namespace_inspect is None:
+            namespaces = self.ui.namespaces()
+            if index >= len(namespaces):
+                return
+            namespace = namespaces[index]
+            records = self.ui.records_in_namespace(namespace)
+            if key == 's':
+                for record in records:
+                    self.start(record)
+            elif key == 'k':
+                for record in records:
+                    self.stop(record)
+            elif key == 'i':
+                self.ui.namespace_inspect = namespace
+            elif key == 'm':
+                for record in records:
+                    record.muted = True
+            elif key == 'u':
+                for record in records:
+                    record.muted = False
+            self.ui.redraw()
             return
-        record = self.records[index]
+
+        records = self.ui.visible_records()
+        if index >= len(records):
+            return
+        record = records[index]
         if key == 's':
             self.start(record)
         elif key == 'k':

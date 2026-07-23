@@ -66,12 +66,19 @@ Global controls are available without selecting a process:
 
 | Key | Action |
 | --- | --- |
+| `F5` | Toggle namespace mode |
 | `F6` | Start all processes |
 | `F7` | Stop all processes |
 | `F8` | Toggle WARN-and-higher output |
 | `F9` | Mute all process output |
 | `F10` | Unmute all process output |
 | `Ctrl-C` | Gracefully stop the complete launch |
+
+Namespace mode groups processes by their top-level ROS namespace, including
+nodes in child namespaces. Select a namespace and press `k` to stop all its
+nodes, `s` to start all its nodes, or `i` to inspect and control the individual
+nodes. Use `m` to mute all output from the namespace and `u` to unmute it.
+Press `Backspace` to return from inspection to the namespace list.
 
 ## Command-line options
 

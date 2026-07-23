@@ -72,6 +72,7 @@ class TerminalUI:
     BAR_KEY = '\x1b[48;2;0;96;96m\x1b[38;2;255;255;255m'
     RUNNING = '\x1b[38;2;0;0;0m\x1b[48;2;24;178;24m'
     CRASHED = '\x1b[38;2;0;0;0m\x1b[48;2;178;24;24m'
+    PARTIAL = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;0m'
     WAITING = '\x1b[38;2;0;0;0m\x1b[48;2;178;104;24m'
     IDLE = '\x1b[38;2;255;255;255m\x1b[48;2;0;0;0m'
     KEY = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;200m'
@@ -82,6 +83,8 @@ class TerminalUI:
         self.on_key = on_key
         self.records: Iterable[ProcessRecord] = []
         self.selected: Optional[int] = None
+        self.namespace_mode = False
+        self.namespace_inspect: Optional[str] = None
         self.warn_only = False
         self._saved_termios = None
         self._status_lines = 0
@@ -94,7 +97,12 @@ class TerminalUI:
             return
         self._saved_termios = termios.tcgetattr(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
-        os.set_blocking(sys.stdin.fileno(), False)
+        # stdin/stdout/stderr commonly share one open file description on a
+        # pseudo-terminal.  Making stdin nonblocking therefore also makes
+        # launch's output writes nonblocking, which can fail with EAGAIN and
+        # shut down the complete LaunchService.  add_reader() only invokes
+        # _read_input when data is ready, so blocking terminal I/O is safe.
+        os.set_blocking(sys.stdout.fileno(), True)
         loop.add_reader(sys.stdin.fileno(), self._read_input)
         sys.stdout.write('\x1b[?25l')
         sys.stdout.flush()
@@ -119,6 +127,54 @@ class TerminalUI:
     def set_records(self, records: Iterable[ProcessRecord]) -> None:
         self.records = records
         self.redraw()
+
+    @staticmethod
+    def namespace_for(record: ProcessRecord) -> str:
+        """Return the top-level namespace containing a process."""
+        parts = [part for part in record.display_name.strip('/').split('/') if part]
+        return parts[0] if len(parts) > 1 else '/'
+
+    def namespaces(self):
+        """Return stable namespace groups represented by the current records."""
+        values = {self.namespace_for(record) for record in self.records}
+        return sorted(values, key=lambda value: (value != '/', value))
+
+    def records_in_namespace(self, namespace: str):
+        """Return every process recursively grouped under a top-level namespace."""
+        return [record for record in self.records
+                if self.namespace_for(record) == namespace]
+
+    def visible_records(self):
+        """Return nodes visible in normal or namespace inspection mode."""
+        if self.namespace_mode and self.namespace_inspect is not None:
+            return self.records_in_namespace(self.namespace_inspect)
+        return list(self.records)
+
+    @staticmethod
+    def namespace_counts(records):
+        """Return running and non-running process counts for a namespace."""
+        alive = sum(record.state is State.RUNNING for record in records)
+        return alive, len(records) - alive
+
+    @classmethod
+    def namespace_style(cls, records):
+        """Color a namespace green, yellow, or red from its live/dead counts."""
+        alive, dead = cls.namespace_counts(records)
+        if dead == 0:
+            return cls.RUNNING
+        if alive == 0:
+            return cls.CRASHED
+        return cls.PARTIAL
+
+    @classmethod
+    def state_style(cls, state: State):
+        """Return the status color for one process state."""
+        return {
+            State.RUNNING: cls.RUNNING,
+            State.CRASHED: cls.CRASHED,
+            State.WAITING: cls.WAITING,
+            State.IDLE: cls.IDLE,
+        }[state]
 
     def log(self, source: str, text: str, is_stderr: bool = False,
             severity: Optional[str] = None) -> None:
@@ -183,8 +239,14 @@ class TerminalUI:
         self._erase_status()
         columns = max(40, shutil.get_terminal_size((100, 24)).columns)
         sep = '\x1b[38;2;0;64;64m' + ('▂' * columns) + self.RESET
+        showing_namespaces = self.namespace_mode and self.namespace_inspect is None
         if self.selected is None:
-            menu = self._menu_item('A-Z', 'Node actions')
+            menu = self._menu_item(
+                'A-Z', 'Namespace actions' if showing_namespaces else 'Node actions')
+            menu += self._menu_item(
+                'F5', 'Node mode' if self.namespace_mode else 'Namespace mode')
+            if self.namespace_mode and self.namespace_inspect is not None:
+                menu += self._menu_item('Backspace', 'Namespaces')
             menu += self._menu_item('F6', 'Start all')
             menu += self._menu_item('F7', 'Stop all')
             menu += self._menu_item('F8', 'Toggle WARN+ only')
@@ -195,36 +257,64 @@ class TerminalUI:
             if any(r.muted for r in self.records):
                 menu += ' \x1b[30;43m ! Caution: Nodes muted ! ' + self.RESET
         else:
-            records = list(self.records)
-            if self.selected >= len(records):
-                self.selected = None
-                return self.redraw()
-            record = records[self.selected]
-            menu = self.BAR + f" Node '{record.display_name}' is {record.state.value}. Actions:"
-            menu += self._menu_item('s', 'start')
-            menu += self._menu_item('k', 'stop')
-            menu += self._menu_item('d', 'debug')
-            menu += self._menu_item('u' if record.muted else 'm',
-                                    'unmute' if record.muted else 'mute')
+            if showing_namespaces:
+                namespaces = self.namespaces()
+                if self.selected >= len(namespaces):
+                    self.selected = None
+                    return self.redraw()
+                namespace = namespaces[self.selected]
+                count = len(self.records_in_namespace(namespace))
+                menu = self.BAR + f" Namespace '{namespace}' has {count} node(s). Actions:"
+                menu += self._menu_item('s', 'start all')
+                menu += self._menu_item('k', 'stop all')
+                menu += self._menu_item('i', 'inspect')
+                menu += self._menu_item('m', 'mute namespace')
+                menu += self._menu_item('u', 'unmute namespace')
+            else:
+                records = self.visible_records()
+                if self.selected >= len(records):
+                    self.selected = None
+                    return self.redraw()
+                record = records[self.selected]
+                menu = self.BAR + f" Node '{record.display_name}' is {record.state.value}. Actions:"
+                menu += self._menu_item('s', 'start')
+                menu += self._menu_item('k', 'stop')
+                menu += self._menu_item('d', 'debug')
+                menu += self._menu_item('u' if record.muted else 'm',
+                                        'unmute' if record.muted else 'mute')
         menu = self._fit(menu, columns)
+
+        if showing_namespaces:
+            entries = []
+            for namespace in self.namespaces():
+                members = self.records_in_namespace(namespace)
+                alive, dead = self.namespace_counts(members)
+                entries.append((
+                    f'{namespace} [{alive}:{dead}]',
+                    self.namespace_style(members),
+                    bool(members) and all(record.muted for record in members),
+                ))
+        else:
+            entries = [(record.display_name, self.state_style(record.state), record.muted)
+                       for record in self.visible_records()]
 
         blocks = []
         line = ''
-        for index, record in enumerate(self.records):
+        for index, (display_name, state_style, muted) in enumerate(entries):
             key = selection_key(index)
             key_text = key if key is not None else ' '
-            key_style = self.MUTED_KEY if record.muted else self.KEY
-            state_style = {
-                State.RUNNING: self.RUNNING,
-                State.CRASHED: self.CRASHED,
-                State.WAITING: self.WAITING,
-                State.IDLE: self.IDLE,
-            }[record.state]
-            name = record.display_name.lstrip('/')[-13:]
+            key_style = self.MUTED_KEY if muted else self.KEY
+            name = display_name if showing_namespaces else display_name.lstrip('/')
+            # Keep the complete process name whenever it fits.  The status
+            # area already wraps blocks onto additional rows, so shortening
+            # every name to 13 characters only hides useful node identity.
+            max_name_length = max(1, columns - 3)
+            if len(name) > max_name_length:
+                name = name[:max_name_length - 1] + '…'
             selected = self.selected == index
-            label = f'[{name:^13}]' if selected else f' {name:^13} '
+            label = f'[{name}]' if selected and not showing_namespaces else f' {name} '
             block = key_style + key_text + state_style + label + self.RESET
-            plain_len = 16
+            plain_len = 1 + len(label)
             if self._visible_len(line) + plain_len + 1 > columns and line:
                 blocks.append(line)
                 line = block
@@ -256,7 +346,7 @@ class TerminalUI:
             return
         self._buffer += data
         keys = {
-            '\x1b[17~': 'F6', '\x1b[18~': 'F7', '\x1b[19~': 'F8',
+            '\x1b[15~': 'F5', '\x1b[17~': 'F6', '\x1b[18~': 'F7', '\x1b[19~': 'F8',
             '\x1b[20~': 'F9', '\x1b[21~': 'F10',
         }
         while self._buffer:
