@@ -1,0 +1,297 @@
+"""ROS 2 launch integration and process supervision."""
+
+import asyncio
+import logging
+import sys
+from typing import Dict, Optional
+
+import launch
+from launch import LaunchDescription, LaunchService
+from launch.actions import ExecuteProcess, IncludeLaunchDescription, RegisterEventHandler
+from launch.event_handlers import OnProcessExit, OnProcessIO, OnProcessStart
+from launch.events.process import ShutdownProcess
+from launch.launch_description_sources import AnyLaunchDescriptionSource
+import launch.logging
+from launch_ros.actions import Node
+from ros2launch.api.api import parse_launch_arguments
+
+from .model import ProcessRecord, selection_key, State
+from .terminal import TerminalUI
+
+
+class _UILogStream:
+    """File-like adapter routing launch framework logs through TerminalUI."""
+
+    encoding = getattr(sys.stdout, 'encoding', 'utf-8')
+
+    def __init__(self, ui: TerminalUI):
+        self._ui = ui
+
+    def write(self, message: str) -> int:
+        if message and message.strip():
+            self._ui.log('launch', message)
+        return len(message)
+
+    @staticmethod
+    def flush() -> None:
+        sys.stdout.flush()
+
+
+class Supervisor:
+    """Run one launch description and expose rosmon-like process controls."""
+
+    def __init__(self, launch_file: str, launch_arguments, *, ui: bool = True,
+                 no_start: bool = False, stop_timeout: float = 5.0,
+                 log_file: Optional[str] = None, flush_log: bool = False,
+                 flush_stdout: bool = False):
+        self.launch_file = launch_file
+        self.launch_arguments = list(launch_arguments)
+        self.no_start = no_start
+        self.stop_timeout = stop_timeout
+        self.flush_stdout = flush_stdout
+        self.records = []
+        self._by_action: Dict[object, ProcessRecord] = {}
+        self._next_key = 0
+        self._launch_service: Optional[LaunchService] = None
+        self._context = None
+        self._shutting_down = False
+        self._no_start_applied = set()
+        self._log_handle = (
+            open(log_file, 'a', buffering=1 if flush_log else -1)
+            if log_file else None
+        )
+        self.ui = TerminalUI(ui, self.handle_key)
+
+    async def run(self) -> int:
+        """Run until the launch service is idle or the user interrupts it."""
+        handlers = [
+            RegisterEventHandler(OnProcessStart(on_start=self._on_start)),
+            RegisterEventHandler(OnProcessIO(
+                on_stdout=lambda event: self._on_output(event, False),
+                on_stderr=lambda event: self._on_output(event, True),
+            )),
+            RegisterEventHandler(OnProcessExit(on_exit=self._on_exit)),
+        ]
+        include = IncludeLaunchDescription(
+            AnyLaunchDescriptionSource(self.launch_file),
+            launch_arguments=parse_launch_arguments(self.launch_arguments),
+        )
+        description = LaunchDescription(handlers + [include])
+        self._launch_service = LaunchService(argv=self.launch_arguments, noninteractive=True)
+        self._launch_service.include_launch_description(description)
+        loop = asyncio.get_running_loop()
+        screen_handler = None
+        original_stream = None
+        if self.ui.enabled:
+            # launch writes directly to stdout by default, which can overwrite
+            # our persistent status bar.  Preserve its messages but route them
+            # through the same erase/log/redraw path as process output.
+            screen_handler = launch.logging.launch_config.get_screen_handler()
+            original_stream = screen_handler.setStream(_UILogStream(self.ui))
+        self.ui.start(loop)
+        self.ui.set_records(self.records)
+        try:
+            # A monitor must remain available after every process is stopped;
+            # otherwise F6 / per-node start could never bring them back.
+            return await self._launch_service.run_async(shutdown_when_idle=False)
+        finally:
+            if screen_handler is not None and original_stream is not None:
+                screen_handler.setStream(original_stream)
+            self.ui.close(loop)
+            if self._log_handle:
+                self._log_handle.close()
+
+    async def shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        if self._context is not None:
+            # LaunchService.shutdown() is thread-safe by blocking on the launch
+            # loop.  We are already in that loop, so emit directly to avoid a
+            # self-deadlock.
+            from launch.events import Shutdown
+            self._context.emit_event_sync(Shutdown(reason='rosmon2 shutdown requested'))
+
+    def _on_start(self, event, context):
+        self._context = context
+        record = self._by_action.get(event.action)
+        if record is None:
+            record = self._record_for_new_action(event)
+            self.records.append(record)
+        elif record.pid is not None:
+            record.restart_count += 1
+        record.action = event.action
+        record.cmd = list(event.cmd)
+        record.cwd = event.cwd
+        record.env = dict(event.env) if event.env else None
+        record.pid = event.pid
+        record.return_code = None
+        record.state = State.RUNNING
+        self._by_action[event.action] = record
+        self._silence_native_process_screen_logger(event.process_name)
+        self._write_log(record.display_name, f'process started with pid {event.pid}', False)
+        if self.no_start and record.key not in self._no_start_applied:
+            self._no_start_applied.add(record.key)
+            record.manually_stopped = True
+            context.asyncio_loop.call_soon(self.stop, record)
+        self.ui.set_records(self.records)
+
+    def _record_for_new_action(self, event) -> ProcessRecord:
+        linked = getattr(event.action, '_rosmon2_record', None)
+        if linked is not None:
+            self._by_action[event.action] = linked
+            return linked
+        display = self._display_name(event.action, event.process_name)
+        record = ProcessRecord(key=self._next_key, display_name=display)
+        self._next_key += 1
+        return record
+
+    @staticmethod
+    def _display_name(action, fallback: str) -> str:
+        if isinstance(action, Node):
+            try:
+                # node_name is already the fully-qualified name after Node.execute().
+                name = action.node_name.replace('<node_namespace_unspecified>', '')
+                return '/' + name.lstrip('/')
+            except (RuntimeError, AttributeError):
+                pass
+        return fallback.rsplit('-', 1)[0] if '-' in fallback else fallback
+
+    @staticmethod
+    def _silence_native_process_screen_logger(process_name: str) -> None:
+        screen_handler = launch.logging.launch_config.get_screen_handler()
+        for suffix in ('-stdout', '-stderr'):
+            logger = logging.getLogger(process_name + suffix)
+            if screen_handler in logger.handlers:
+                logger.removeHandler(screen_handler)
+
+    def _on_output(self, event, is_stderr: bool):
+        record = self._by_action.get(event.action)
+        source = record.display_name if record else event.process_name
+        text = event.text.decode(errors='replace')
+        self._write_log(source, text.rstrip('\n'), is_stderr)
+        if record is None or not record.muted:
+            self.ui.log(source, text, is_stderr=is_stderr)
+        if self.flush_stdout:
+            sys.stdout.flush()
+
+    def _write_log(self, source: str, text: str, is_stderr: bool) -> None:
+        if not self._log_handle:
+            return
+        channel = 'stderr' if is_stderr else 'stdout'
+        for line in text.splitlines() or ['']:
+            self._log_handle.write(f'[{channel}] {source}: {line}\n')
+
+    def _on_exit(self, event, context):
+        record = self._by_action.get(event.action)
+        if record is None:
+            return
+        record.pid = None
+        record.return_code = event.returncode
+        if record.manually_stopped or event.returncode == 0:
+            record.state = State.IDLE
+        else:
+            record.state = State.CRASHED
+        self._write_log(record.display_name,
+                        f'process exited with code {event.returncode}', event.returncode != 0)
+        self.ui.set_records(self.records)
+
+    def handle_key(self, key: str) -> None:
+        """Apply rosmon's two-key node action interface."""
+        if self.ui.selected is None:
+            if key == 'F6':
+                for record in self.records:
+                    self.start(record)
+                return
+            if key == 'F7':
+                for record in self.records:
+                    self.stop(record)
+                return
+            if key == 'F8':
+                self.ui.warn_only = not self.ui.warn_only
+                self.ui.redraw()
+                return
+            if key == 'F9':
+                for record in self.records:
+                    record.muted = True
+                self.ui.redraw()
+                return
+            if key == 'F10':
+                for record in self.records:
+                    record.muted = False
+                self.ui.redraw()
+                return
+            for index, _record in enumerate(self.records):
+                if key == selection_key(index):
+                    self.ui.selected = index
+                    self.ui.redraw()
+                    return
+            return
+
+        index = self.ui.selected
+        self.ui.selected = None
+        if index >= len(self.records):
+            return
+        record = self.records[index]
+        if key == 's':
+            self.start(record)
+        elif key == 'k':
+            self.stop(record)
+        elif key == 'm':
+            record.muted = True
+        elif key == 'u':
+            record.muted = False
+        elif key == 'd':
+            self.debug(record)
+        self.ui.redraw()
+
+    def stop(self, record: ProcessRecord) -> None:
+        """Gracefully stop one running launch process."""
+        record.manually_stopped = True
+        if record.pid is None or self._context is None:
+            record.state = State.IDLE
+            self.ui.redraw()
+            return
+        target = record.action
+        # The keyboard reader runs in the launch event loop.  Calling the
+        # thread-safe LaunchService.emit_event() here would wait on this same
+        # loop and deadlock it.
+        self._context.emit_event_sync(
+            ShutdownProcess(process_matcher=lambda action: action is target)
+        )
+
+    def start(self, record: ProcessRecord) -> None:
+        """Start a stopped process again from its fully expanded command."""
+        if record.pid is not None or not record.cmd or self._context is None:
+            return
+        record.manually_stopped = False
+        record.state = State.WAITING
+        record.restart_count += 1
+        action = ExecuteProcess(
+            cmd=record.cmd,
+            cwd=record.cwd,
+            env=record.env,
+            name=f'rosmon2_{record.key}_{record.restart_count}',
+            output='log',
+            sigterm_timeout=str(self.stop_timeout),
+            sigkill_timeout=str(max(1.0, self.stop_timeout)),
+        )
+        action._rosmon2_record = record
+        self._by_action[action] = record
+        action.execute(self._context)
+        self.ui.redraw()
+
+    def debug(self, record: ProcessRecord) -> None:
+        """Restart a stopped process under gdb when it is installed."""
+        import shutil
+        if shutil.which('gdb') is None:
+            self.ui.notice('gdb is not installed; cannot debug this process', error=True)
+            return
+        if record.pid is not None:
+            self.stop(record)
+            self.ui.notice("stop completed; press the node key then 'd' again to start gdb")
+            return
+        original = record.cmd
+        record.cmd = ['gdb', '--args'] + original
+        self.start(record)
+        record.cmd = original
