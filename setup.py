@@ -27,6 +27,7 @@ setup(
         'console_scripts': [
             'mon2 = rosmon2.cli:main',
             'rosmon2 = rosmon2.cli:main',
+            'rosmon2-mcp = rosmon2.mcp_server:main',
         ],
     },
 )

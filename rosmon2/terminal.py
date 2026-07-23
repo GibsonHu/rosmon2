@@ -80,8 +80,10 @@ class TerminalUI:
     KEY = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;200m'
     MUTED_KEY = '\x1b[38;2;255;255;255m\x1b[48;2;165;0;0m'
 
-    def __init__(self, enabled: bool, on_key: Callable[[str], None]):
+    def __init__(self, enabled: bool, on_key: Callable[[str], None],
+                 output_enabled: bool = True):
         self.enabled = bool(enabled and sys.stdin.isatty() and sys.stdout.isatty())
+        self.output_enabled = output_enabled
         self.on_key = on_key
         self.records: Iterable[ProcessRecord] = []
         self.selected: Optional[int] = None
@@ -195,6 +197,8 @@ class TerminalUI:
     def log(self, source: str, text: str, is_stderr: bool = False,
             severity: Optional[str] = None) -> None:
         """Print one or more process output lines above the status bar."""
+        if not self.output_enabled:
+            return
         self._erase_status()
         width = max([len(r.display_name) for r in self.records] + [len(source), 8])
         clean = text.replace('\r\n', '\n').replace('\r', '\n')

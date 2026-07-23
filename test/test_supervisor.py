@@ -1,6 +1,8 @@
+import asyncio
+
 from launch_ros.actions import Node
 
-from rosmon2.model import ProcessRecord
+from rosmon2.model import ProcessRecord, State
 from rosmon2.supervisor import Supervisor
 
 
@@ -118,3 +120,49 @@ def test_node_search_backspace_and_escape_cancel():
     supervisor.handle_key('ESC')
     assert not supervisor.ui.search_active
     assert supervisor.ui.selected is None
+
+
+def test_control_status_and_namespace_mute_are_structured():
+    supervisor = Supervisor('', [], ui=False, control=False)
+    root = ProcessRecord(
+        key=0, display_name='hardware_setup', state=State.RUNNING, pid=100)
+    driver = ProcessRecord(
+        key=1, display_name='ur10e/driver', state=State.CRASHED, return_code=2)
+    helper = ProcessRecord(
+        key=2, display_name='ur10e/helper', state=State.RUNNING, pid=101)
+    supervisor.records.extend([root, driver, helper])
+
+    status = asyncio.run(supervisor.control_request({'command': 'status'}))
+    assert status['summary'] == {
+        'total': 3,
+        'idle': 0,
+        'running': 2,
+        'crashed': 1,
+        'waiting': 0,
+    }
+    ur10e = next(item for item in status['namespaces'] if item['name'] == 'ur10e')
+    assert (ur10e['alive'], ur10e['dead']) == (1, 1)
+
+    result = asyncio.run(supervisor.control_request({
+        'command': 'mute',
+        'namespace': '/ur10e',
+    }))
+    assert result['matched'] == 2
+    assert not root.muted
+    assert driver.muted and helper.muted
+
+
+def test_control_wait_returns_when_target_is_already_in_state():
+    supervisor = Supervisor('', [], ui=False, control=False)
+    supervisor.records.append(ProcessRecord(
+        key=0, display_name='ur10e/driver', state=State.RUNNING, pid=100))
+
+    result = asyncio.run(supervisor.control_request({
+        'command': 'wait',
+        'node': '/ur10e/driver',
+        'state': 'running',
+        'timeout': 0,
+    }))
+
+    assert result['matched'] == 1
+    assert result['nodes'][0]['name'] == '/ur10e/driver'
