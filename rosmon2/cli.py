@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
 from datetime import datetime
@@ -15,6 +16,17 @@ from ros2launch.api import print_arguments_of_launch_file
 
 from .control import ControlClient, ControlError, validate_session_name
 from .supervisor import Supervisor
+
+
+ROSMON_CONSOLE_OUTPUT_FORMAT = '[{severity}] [{function_name}]: {message}'
+
+
+def configure_ros_console_output() -> None:
+    """Use rosmon's compact function/message layout unless the user overrides it."""
+    os.environ.setdefault(
+        'RCUTILS_CONSOLE_OUTPUT_FORMAT',
+        ROSMON_CONSOLE_OUTPUT_FORMAT,
+    )
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -181,6 +193,7 @@ def main(argv=None) -> int:
         if not args.json_events:
             print(f'Tip: process output is also written to {log_file}')
 
+    configure_ros_console_output()
     supervisor = Supervisor(
         launch_file,
         launch_arguments,

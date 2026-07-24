@@ -37,9 +37,8 @@ class _UILogStream:
             self._ui.log('launch', message)
         return len(message)
 
-    @staticmethod
-    def flush() -> None:
-        sys.stdout.flush()
+    def flush(self) -> None:
+        self._ui.flush()
 
 
 class Supervisor:
@@ -227,7 +226,7 @@ class Supervisor:
         if record is None or not record.muted:
             self.ui.log(source, text, is_stderr=is_stderr)
         if self.flush_stdout:
-            sys.stdout.flush()
+            self.ui.flush()
 
     def _write_log(self, source: str, text: str, is_stderr: bool) -> None:
         if not self._log_handle:

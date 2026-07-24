@@ -10,6 +10,49 @@ def test_ros_severity_takes_precedence_over_stderr_channel():
     assert TerminalUI._severity('plain stderr', None, True) == 'ERROR'
 
 
+def test_ros_console_metadata_keeps_last_context_field():
+    line = (
+        '[ERROR] [1784782198.813074890] [ur10e.robot_state_receiver]: '
+        'Cannot find any device'
+    )
+
+    assert TerminalUI._message_body(line) == (
+        '[ur10e.robot_state_receiver]: Cannot find any device'
+    )
+    assert TerminalUI._message_body(
+        '[INFO] [core::RobotModel::buildModel]: Loading model'
+    ) == '[core::RobotModel::buildModel]: Loading model'
+    assert TerminalUI._message_body(
+        '[WARN] []: Function unavailable'
+    ) == '[]: Function unavailable'
+    assert TerminalUI._message_body('[WARN] message without metadata') == (
+        '[WARN] message without metadata'
+    )
+    assert TerminalUI._message_body('\x1b[36mcolored message\x1b[0m') == (
+        '\x1b[36mcolored message\x1b[0m'
+    )
+
+
+def test_log_row_keeps_process_label_context_and_message(capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.records = [
+        ProcessRecord(key=0, display_name='ur10e/robot_state_receiver'),
+    ]
+
+    ui.log(
+        'ur10e/robot_state_receiver',
+        '[INFO] [1784782198.813074890] [receiver]: Device connected',
+    )
+
+    output = ANSI_RE.sub('', capsys.readouterr().out)
+    assert output == (
+        'ur10e/robot_state_receiver: [receiver]: Device connected\n'
+    )
+    assert '[INFO]' not in output
+    assert '[1784782198.813074890]' not in output
+    assert '[receiver]' in output
+
+
 def test_processes_get_distinct_stable_label_colors():
     ui = TerminalUI(False, lambda _key: None)
     ui.records = [
@@ -19,6 +62,35 @@ def test_processes_get_distinct_stable_label_colors():
     assert ui._label_color('/talker') != ui._label_color('/listener')
     assert ui._label_color('/talker') == ui._label_color('/talker')
     assert ui._label_color('launch') is None
+
+
+def test_process_label_cache_rebuilds_only_when_names_change(monkeypatch):
+    color_calls = []
+
+    def fake_color(hue):
+        color_calls.append(hue)
+        return (int(hue), 1, 2)
+
+    monkeypatch.setattr('rosmon2.terminal._hsluv_label_color', fake_color)
+    ui = TerminalUI(False, lambda _key: None)
+    records = [
+        ProcessRecord(key=0, display_name='talker'),
+        ProcessRecord(key=1, display_name='robot/long_listener'),
+    ]
+
+    ui.set_records(records)
+    first_label = ui._styled_label('talker', ui._label_width)
+    assert len(ANSI_RE.sub('', first_label)) == ui._label_width + 1
+    assert len(color_calls) == 2
+
+    records[0].state = State.RUNNING
+    ui.set_records(records)
+    assert ui._styled_label('talker', ui._label_width) is first_label
+    assert len(color_calls) == 2
+
+    records.append(ProcessRecord(key=2, display_name='relay'))
+    ui.set_records(records)
+    assert len(color_calls) == 5
 
 
 def test_hsluv_colors_match_rosmon_reference_palette():
@@ -69,6 +141,159 @@ def test_status_bar_shows_complete_process_names(monkeypatch, capsys):
     assert 'hardware_setup' in output
     assert 'ur10e/ur_ros_rtde/robot_state_receiver' in output
     assert 'ardware_setup' not in output.replace('hardware_setup', '')
+
+
+def test_batched_log_output_reprints_status_without_a_flash(
+        monkeypatch, capsys):
+    class FakeTimer:
+        def __init__(self, callback):
+            self.callback = callback
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeLoop:
+        def __init__(self):
+            self.timers = []
+
+        def call_later(self, _delay, callback):
+            timer = FakeTimer(callback)
+            self.timers.append(timer)
+            return timer
+
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui._loop = FakeLoop()
+    ui._last_redraw_at = 10.0
+    ui.records = [
+        ProcessRecord(key=0, display_name='robot/driver', state=State.RUNNING),
+    ]
+    monkeypatch.setattr('rosmon2.terminal.time.monotonic', lambda: 10.01)
+    monkeypatch.setattr(
+        'rosmon2.terminal.shutil.get_terminal_size',
+        lambda _fallback: os.terminal_size((100, 24)),
+    )
+    ui.set_records(ui.records)
+    capsys.readouterr()
+    ui._last_redraw_at = 10.0
+
+    ui.log('robot/driver', '[INFO] [callback]: first')
+    ui.log('robot/driver', '[INFO] [callback]: second')
+
+    output = capsys.readouterr().out
+    assert output == ''
+    assert len(ui._loop.timers) == 1
+
+    ui._loop.timers[0].callback()
+
+    output = ANSI_RE.sub('', capsys.readouterr().out)
+    assert '[callback]: first' in output
+    assert '[callback]: second' in output
+    assert '▂' in output
+    assert len(ui._loop.timers) == 1
+    assert ui._redraw_timer is None
+
+    record = ui.records[0]
+    record.state = State.CRASHED
+    ui.set_records(ui.records)
+
+    output = capsys.readouterr().out
+    assert '▂' in output
+    assert ui._redraw_timer is None
+
+
+def test_close_drains_batched_output(monkeypatch, capsys):
+    class FakeTimer:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeLoop:
+        def __init__(self):
+            self.timers = []
+
+        def call_later(self, _delay, _callback):
+            timer = FakeTimer()
+            self.timers.append(timer)
+            return timer
+
+    ui = TerminalUI(False, lambda _key: None)
+    loop = FakeLoop()
+    ui.start(loop)
+
+    ui.log('driver', '[INFO] [callback]: final message')
+    assert capsys.readouterr().out == ''
+
+    ui.close()
+
+    output = ANSI_RE.sub('', capsys.readouterr().out)
+    assert output == '  driver: [callback]: final message\n'
+    assert loop.timers[0].cancelled
+
+
+def test_unchanged_status_render_is_reused(monkeypatch, capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui.records = [
+        ProcessRecord(key=0, display_name='robot/driver', state=State.RUNNING),
+    ]
+    monkeypatch.setattr(
+        'rosmon2.terminal.shutil.get_terminal_size',
+        lambda _fallback: os.terminal_size((100, 24)),
+    )
+    visible_len_calls = []
+    original_visible_len = ui._visible_len
+    monkeypatch.setattr(
+        ui,
+        '_visible_len',
+        lambda text: visible_len_calls.append(text) or original_visible_len(text),
+    )
+
+    ui.redraw()
+    assert visible_len_calls
+    visible_len_calls.clear()
+
+    ui.redraw()
+
+    capsys.readouterr()
+    assert visible_len_calls == []
+
+
+def test_redraw_erases_and_replaces_status_in_one_write(monkeypatch):
+    class Output:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, text):
+            self.writes.append(text)
+
+        def flush(self):
+            pass
+
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui._status_lines = 2
+    ui.records = [
+        ProcessRecord(key=0, display_name='robot/driver', state=State.RUNNING),
+    ]
+    output = Output()
+    monkeypatch.setattr('rosmon2.terminal.sys.stdout', output)
+    monkeypatch.setattr(
+        'rosmon2.terminal.shutil.get_terminal_size',
+        lambda _fallback: os.terminal_size((100, 24)),
+    )
+
+    ui.redraw()
+
+    assert len(output.writes) == 1
+    assert output.writes[0].startswith('\r\x1b[J')
+    assert 'robot/driver' in output.writes[0]
 
 
 def test_selected_node_uses_light_blue_background(monkeypatch, capsys):
