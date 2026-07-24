@@ -296,6 +296,77 @@ def test_redraw_erases_and_replaces_status_in_one_write(monkeypatch):
     assert 'robot/driver' in output.writes[0]
 
 
+def test_status_returns_to_its_origin_after_rendering():
+    status = TerminalUI._status_text(('first', 'second'))
+
+    assert status == 'first\nsecond\n\x1b[2A\r'
+
+
+def test_resize_is_debounced_then_rebuilds_only_the_footer(monkeypatch, capsys):
+    class FakeTimer:
+        def __init__(self, callback):
+            self.callback = callback
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeLoop:
+        def __init__(self):
+            self.timers = []
+
+        def call_later(self, _delay, callback):
+            timer = FakeTimer(callback)
+            self.timers.append(timer)
+            return timer
+
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui._loop = FakeLoop()
+    ui._status_lines = 4
+    ui.records = [
+        ProcessRecord(key=0, display_name='robot/driver', state=State.RUNNING),
+    ]
+    monkeypatch.setattr(
+        'rosmon2.terminal.shutil.get_terminal_size',
+        lambda _fallback: os.terminal_size((80, 24)),
+    )
+
+    ui._schedule_resize_redraw()
+    first = ui._loop.timers[-1]
+    ui._schedule_resize_redraw()
+    second = ui._loop.timers[-1]
+
+    assert first.cancelled
+    second.callback()
+
+    output = capsys.readouterr().out
+    assert output.startswith('\r\x1b[J')
+    assert '\x1b[2J' not in output
+    assert '\x1b[H' not in output
+    assert output.count('robot/driver') == 1
+
+
+def test_footer_leaves_last_terminal_column_unused(monkeypatch, capsys):
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui.records = [
+        ProcessRecord(key=0, display_name='robot/driver', state=State.RUNNING),
+    ]
+    monkeypatch.setattr(
+        'rosmon2.terminal.shutil.get_terminal_size',
+        lambda _fallback: os.terminal_size((20, 24)),
+    )
+
+    ui.redraw()
+    capsys.readouterr()
+
+    assert all(ui._visible_len(line) <= 19 for line in ui._render_cache_lines)
+    assert ui._visible_len(ui._render_cache_lines[0]) == 19
+
+
 def test_selected_node_uses_light_blue_background(monkeypatch, capsys):
     ui = TerminalUI(False, lambda _key: None)
     ui.enabled = True

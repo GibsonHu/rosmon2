@@ -3,6 +3,7 @@
 from math import cos, pi, sin
 import os
 import re
+import signal
 import shutil
 import sys
 import termios
@@ -74,6 +75,7 @@ class TerminalUI:
     OUTPUT_FLUSH_INTERVAL = 1.0 / 60.0
     OUTPUT_BUFFER_LIMIT = 64 * 1024
     REDRAW_INTERVAL = 1.0 / 30.0
+    RESIZE_REDRAW_DELAY = 0.10
     RESET = '\x1b[0m'
     # Exact true-color styles from rosmon's UI. Its packed 0xBBGGRR values
     # 0x404000, 0x606000, and 0xC8C8C8 become the RGB values below.
@@ -111,6 +113,8 @@ class TerminalUI:
         self._output_buffer = []
         self._output_buffer_size = 0
         self._redraw_timer = None
+        self._resize_timer = None
+        self._resize_handler_registered = False
         self._last_redraw_at = 0.0
         self._render_cache_key = None
         self._render_cache_lines = None
@@ -140,6 +144,13 @@ class TerminalUI:
         sys.stdout.write('\x1b[?25l')
         sys.stdout.flush()
         self._started = True
+        add_signal_handler = getattr(loop, 'add_signal_handler', None)
+        if add_signal_handler is not None:
+            try:
+                add_signal_handler(signal.SIGWINCH, self._schedule_resize_redraw)
+                self._resize_handler_registered = True
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
 
     def close(self, loop=None) -> None:
         """Restore the user's terminal even when launch was interrupted."""
@@ -161,6 +172,16 @@ class TerminalUI:
         if self._redraw_timer is not None:
             self._redraw_timer.cancel()
             self._redraw_timer = None
+        if self._resize_timer is not None:
+            self._resize_timer.cancel()
+            self._resize_timer = None
+        resize_loop = loop if loop is not None else self._loop
+        if self._resize_handler_registered and resize_loop is not None:
+            try:
+                resize_loop.remove_signal_handler(signal.SIGWINCH)
+            except (AttributeError, NotImplementedError, RuntimeError, ValueError):
+                pass
+            self._resize_handler_registered = False
         self._erase_status()
         sys.stdout.write(self.RESET + '\x1b[?25h')
         sys.stdout.flush()
@@ -384,7 +405,7 @@ class TerminalUI:
         if not redrawn:
             sys.stdout.flush()
 
-    def redraw(self) -> None:
+    def redraw(self, *, prefix: str = '') -> None:
         if self._redraw_timer is not None:
             self._redraw_timer.cancel()
             self._redraw_timer = None
@@ -393,8 +414,12 @@ class TerminalUI:
         # Keep erasing the previous status and drawing its replacement in one
         # terminal write.  Selection keys redraw immediately; sending ESC[J
         # first can otherwise leave a visible blank frame in some terminals.
-        erase = self._take_status_erase()
-        columns = max(40, shutil.get_terminal_size((100, 24)).columns)
+        erase = prefix + self._take_status_erase()
+        # Never write into the terminal's final column.  VTE-based terminals
+        # such as Terminator mark that cell for an automatic wrap; the
+        # following newline can then make one logical footer row occupy two
+        # physical rows and invalidate our cursor-up count after a resize.
+        columns = max(4, shutil.get_terminal_size((100, 24)).columns - 1)
         render_key = self._status_render_key(columns)
         if self._render_cache_key == render_key:
             self._draw_status_lines(self._render_cache_lines, prefix=erase)
@@ -537,6 +562,23 @@ class TerminalUI:
 
     def _run_scheduled_redraw(self) -> None:
         self._redraw_timer = None
+        self.redraw()
+
+    def _schedule_resize_redraw(self) -> None:
+        """Recover the footer after terminal reflow settles."""
+        if self._loop is None or not self._started:
+            return
+        if self._resize_timer is not None:
+            self._resize_timer.cancel()
+        self._resize_timer = self._loop.call_later(
+            self.RESIZE_REDRAW_DELAY, self._redraw_after_resize)
+
+    def _redraw_after_resize(self) -> None:
+        self._resize_timer = None
+        if not self.enabled or not self._started:
+            return
+        # Once resize events settle, erase and rebuild only the footer at its
+        # existing origin.  The log area and terminal scrollback stay intact.
         self.redraw()
 
     def _status_render_key(self, columns: int):
