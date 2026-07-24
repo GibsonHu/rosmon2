@@ -1,6 +1,12 @@
+import os
+
 import pytest
 
-from rosmon2.cli import resolve_launch_spec
+from rosmon2.cli import (
+    configure_ros_console_output,
+    resolve_launch_spec,
+    ROSMON_CONSOLE_OUTPUT_FORMAT,
+)
 
 
 def test_resolve_file_and_arguments(tmp_path):
@@ -14,3 +20,16 @@ def test_resolve_file_and_arguments(tmp_path):
 def test_rejects_too_many_specifiers():
     with pytest.raises(ValueError):
         resolve_launch_spec(['one', 'two', 'three'])
+
+
+def test_rosmon_console_format_uses_function_and_respects_override(monkeypatch):
+    monkeypatch.delenv('RCUTILS_CONSOLE_OUTPUT_FORMAT', raising=False)
+    configure_ros_console_output()
+    assert (
+        os.environ['RCUTILS_CONSOLE_OUTPUT_FORMAT']
+        == ROSMON_CONSOLE_OUTPUT_FORMAT
+    )
+
+    monkeypatch.setenv('RCUTILS_CONSOLE_OUTPUT_FORMAT', '{message}')
+    configure_ros_console_output()
+    assert os.environ['RCUTILS_CONSOLE_OUTPUT_FORMAT'] == '{message}'
