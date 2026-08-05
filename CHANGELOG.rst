@@ -4,6 +4,7 @@ Changelog for package rosmon2
 
 Forthcoming
 -----------
+* Timestamped each line written to the ``--log`` file.
 * Added a dependency-free MCP server for inspecting and controlling sessions.
 * Added named control sessions, structured JSON output, log queries, event
   streaming, and deterministic state waits.
