@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime
 
 from launch_ros.actions import Node
 
@@ -2464,3 +2465,52 @@ def test_codex_python_node_tool_rejects_implicit_external_and_duplicate(
             call, 'start this Python script as a node'))
     assert not success
     assert 'already exists' in message
+
+
+def test_log_file_lines_are_timestamped(tmp_path):
+    """The --log file outlives the session; the in-memory ring does not.
+
+    rosmon2_logs carries a timestamp per entry but keeps only the last
+    _logs.maxlen across every process, so any launch of real size loses its
+    early history and the whole thing vanishes when the session exits. This
+    file is what a post-mortem actually has, and without a clock on it
+    "node A went quiet while node B was still retrying" cannot be answered.
+    """
+    log_file = tmp_path / 'rosmon2.log'
+    supervisor = Supervisor(
+        '', [], ui=False, control=False, log_file=str(log_file))
+
+    supervisor._write_log('track_3d', '[INFO] tracking initialized', False)
+    supervisor._write_log('camera', 'device disconnected', True)
+    supervisor._log_handle.flush()
+
+    lines = log_file.read_text().splitlines()
+    assert len(lines) == 2
+    stamp, rest = lines[0].split('] ', 1)
+    datetime.strptime(stamp.lstrip('['), '%Y-%m-%d %H:%M:%S.%f')
+    # The old format stays intact as a suffix so existing greps keep working.
+    assert rest == '[stdout] track_3d: [INFO] tracking initialized'
+    assert lines[1].endswith('[stderr] camera: device disconnected')
+
+
+def test_log_file_splits_multiline_output_into_stamped_lines(tmp_path):
+    """One read can carry several lines; each needs its own clock."""
+    log_file = tmp_path / 'rosmon2.log'
+    supervisor = Supervisor(
+        '', [], ui=False, control=False, log_file=str(log_file))
+
+    supervisor._write_log('planner', 'first\nsecond', False)
+    supervisor._log_handle.flush()
+
+    lines = log_file.read_text().splitlines()
+    assert len(lines) == 2
+    for line, expected in zip(lines, ('first', 'second')):
+        stamp, rest = line.split('] ', 1)
+        datetime.strptime(stamp.lstrip('['), '%Y-%m-%d %H:%M:%S.%f')
+        assert rest == f'[stdout] planner: {expected}'
+
+
+def test_no_log_file_is_not_an_error():
+    """--log is optional; the tee is simply skipped."""
+    supervisor = Supervisor('', [], ui=False, control=False)
+    supervisor._write_log('track_3d', 'hello', False)

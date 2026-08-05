@@ -415,11 +415,26 @@ class Supervisor:
             self.ui.flush()
 
     def _write_log(self, source: str, text: str, is_stderr: bool) -> None:
+        """Append process output to the ``--log`` file, one line per line.
+
+        Timestamped, because the file outlives the session and the in-memory
+        ring does not: ``rosmon2_logs`` carries a timestamp per entry but holds
+        only the last ``_logs.maxlen`` across *all* processes, so on a launch of
+        any size a post-mortem has nothing but this file. Without a clock on it,
+        "node A went quiet while node B was still retrying" is unanswerable —
+        which is the question a multi-process log exists to answer.
+
+        Local time to the millisecond, matching what most ROS nodes print in
+        their own lines, so the two read as one stream. The timestamp is a
+        prefix rather than an insertion, leaving ``[channel] source: line``
+        intact as a suffix — existing greps keep working.
+        """
         if not self._log_handle:
             return
         channel = 'stderr' if is_stderr else 'stdout'
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         for line in text.splitlines() or ['']:
-            self._log_handle.write(f'[{channel}] {source}: {line}\n')
+            self._log_handle.write(f'[{stamp}] [{channel}] {source}: {line}\n')
 
     def _on_exit(self, event, context):
         record = self._by_action.get(event.action)
